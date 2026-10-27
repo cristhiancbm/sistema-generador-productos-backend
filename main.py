@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from app.database.config import verificar_conexion_db
 from app.database.runner import ejecutar_migraciones
 
-
+from app.routers.producto import router as producto_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     verificar_conexion_db()
@@ -19,6 +19,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(producto_router)
 
 # Endpoint GET raíz
 @app.get("/")
