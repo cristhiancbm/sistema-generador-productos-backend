@@ -1,11 +1,13 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.database.config import verificar_conexion_db
+from app.database.runner import ejecutar_migraciones
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     verificar_conexion_db()
+    ejecutar_migraciones()
     yield
 
 
