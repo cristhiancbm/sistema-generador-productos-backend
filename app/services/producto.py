@@ -6,14 +6,59 @@ from sqlalchemy import text
 from app.database.config import SessionLocal
 from app.services.groq_service import consultar_modelo_groq
 
-
 from dotenv import load_dotenv
 
-# Carga las variables definidas en el archivo .env
 load_dotenv()
-
-# Lee las credenciales
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+
+def _consultar_y_parsear_ia(nombre: str) -> tuple[str, str]:
+    """Genera el prompt, consulta a Groq y extrae descripción y características."""
+    prompt = f"""Para el producto '{nombre}', genera:
+1. Una descripción comercial atractiva (máximo 30 palabras).
+2. Sus características principales (máximo 20 palabras).
+
+Responde estrictamente con este formato, sin saludos ni texto adicional:
+DESCRIPCION: [Tu descripción aquí]
+CARACTERISTICAS: [Tus características aquí]"""
+
+    respuesta_ia = consultar_modelo_groq(prompt)
+
+    descripcion_ia = ""
+    caracteristicas_ia = ""
+
+    for linea in respuesta_ia.split("\n"):
+        if linea.startswith("DESCRIPCION:"):
+            descripcion_ia = linea.replace("DESCRIPCION:", "").strip()
+        elif linea.startswith("CARACTERISTICAS:"):
+            caracteristicas_ia = linea.replace("CARACTERISTICAS:", "").strip()
+
+    if not descripcion_ia and not caracteristicas_ia:
+        descripcion_ia = respuesta_ia
+
+    return descripcion_ia, caracteristicas_ia
+
+
+def _actualizar_producto_en_db(db, prod_id: int, desc: str, carac: str):
+    """Actualiza las columnas del producto en MySQL y lo marca como completado."""
+    db.execute(
+        text(
+            "UPDATE productos SET descripcion = :desc, caracteristicas = :carac, estado = 'completado' WHERE id = :id"
+        ),
+        {"desc": desc, "carac": carac, "id": prod_id},
+    )
+def _disparar_webhook(webhook_url: str, ticket_id: str, resultados: list):
+    """Envía la notificación HTTP POST con los resultados procesados."""
+    payload = {
+        "ticket_id": ticket_id,
+        "estado": "completado",
+        "productos": resultados,
+    }
+    try:
+        with httpx.Client() as client:
+            client.post(webhook_url, json=payload, timeout=10.0)
+    except Exception as webhook_error:
+        print(f"Error al enviar el webhook: {webhook_error}")
 
 
 def procesar_lote_en_segundo_plano(ticket_id: str, productos_info: list):
@@ -25,43 +70,11 @@ def procesar_lote_en_segundo_plano(ticket_id: str, productos_info: list):
             prod_id = item["id"]
             nombre = item["nombre"]
 
-            # Prompt estricto para limitar la longitud (máx. 50 palabras en total) y separar campos
-            prompt = f"""Para el producto '{nombre}', genera:
-1. Una descripción comercial atractiva (máximo 30 palabras).
-2. Sus características principales (máximo 20 palabras).
+            # 1. Obtener datos limpios de la IA
+            descripcion_ia, caracteristicas_ia = _consultar_y_parsear_ia(nombre)
 
-Responde estrictamente con este formato, sin saludos ni texto adicional:
-DESCRIPCION: [Tu descripción aquí]
-CARACTERISTICAS: [Tus características aquí]"""
-
-            # Llamada a Groq
-            respuesta_ia = consultar_modelo_groq(prompt)
-
-            # Parsear la respuesta para separar descripción y características
-            descripcion_ia = ""
-            caracteristicas_ia = ""
-
-            for linea in respuesta_ia.split("\n"):
-                if linea.startswith("DESCRIPCION:"):
-                    descripcion_ia = linea.replace("DESCRIPCION:", "").strip()
-                elif linea.startswith("CARACTERISTICAS:"):
-                    caracteristicas_ia = linea.replace("CARACTERISTICAS:", "").strip()
-
-            # Fallback por si la IA no sigue estrictamente el formato
-            if not descripcion_ia:
-                descripcion_ia = respuesta_ia
-
-            # Actualizamos AMBAS columnas en la base de datos
-            db.execute(
-                text(
-                    "UPDATE productos SET descripcion = :desc, caracteristicas = :carac, estado = 'completado' WHERE id = :id"
-                ),
-                {
-                    "desc": descripcion_ia,
-                    "carac": caracteristicas_ia,
-                    "id": prod_id,
-                },
-            )
+            # 2. Actualizar base de datos
+            _actualizar_producto_en_db(db, prod_id, descripcion_ia, caracteristicas_ia)
 
             resultados_procesados.append(
                 {
@@ -72,7 +85,7 @@ CARACTERISTICAS: [Tus características aquí]"""
                 }
             )
 
-        # 1. Actualizamos la tarea a 'completado'
+        # 3. Actualizar la tarea del ticket a completado
         db.execute(
             text(
                 "UPDATE async_tasks SET estado = 'completado' WHERE ticket_id = :ticket"
@@ -80,7 +93,7 @@ CARACTERISTICAS: [Tus características aquí]"""
             {"ticket": ticket_id},
         )
 
-        # 2. Consultamos la webhook_url guardada en la base de datos para este ticket
+        # 4. Obtener URL del webhook
         res_task = db.execute(
             text("SELECT webhook_url FROM async_tasks WHERE ticket_id = :ticket"),
             {"ticket": ticket_id},
@@ -88,19 +101,9 @@ CARACTERISTICAS: [Tus características aquí]"""
 
         db.commit()
 
-        # 3. DISPARAR EL WEBHOOK REAL HACIA WEBHOOK.SITE
+        # 5. Notificar por webhook si existe la URL
         if res_task and res_task[0]:
-            webhook_url = res_task[0]
-            payload = {
-                "ticket_id": ticket_id,
-                "estado": "completado",
-                "productos": resultados_procesados,
-            }
-            try:
-                with httpx.Client() as client:
-                    client.post(webhook_url, json=payload, timeout=10.0)
-            except Exception as webhook_error:
-                print(f"Error al enviar el webhook: {webhook_error}")
+            _disparar_webhook(res_task[0], ticket_id, resultados_procesados)
 
     except Exception as e:
         db.rollback()
@@ -117,8 +120,6 @@ CARACTERISTICAS: [Tus características aquí]"""
 def registrar_y_procesar_lote(productos: list, background_tasks: BackgroundTasks, db):
     lote_id = str(uuid.uuid4())
     ticket_id = str(uuid.uuid4())
-
-    # Colocar aquí tu URL única de Webhook.site
     url_webhook_prueba = WEBHOOK_URL
 
     db.execute(
